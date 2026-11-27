@@ -8,8 +8,10 @@ import sys
 import threading
 import time
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, RedirectResponse, JSONResponse
+import base64, hashlib, hmac, secrets
+from urllib.parse import parse_qs
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "radio"), str(ROOT / "extractor")]
@@ -29,6 +31,81 @@ if BITRATE not in ("128", "192", "256"):
 CONTENT = os.getenv("RADIO_CONTENT", "ads,news,dj,talk,jingles").split(",")
 DJ = os.getenv("RADIO_DJ", "true").lower() in ("1", "true", "yes")
 app = FastAPI(title="AWC Radio Web")
+
+# Remote authentication is opt-in; retain the existing NPM access list until tested.
+AUTH_PASSWORD = os.getenv("RADIO_AUTH_PASSWORD", "")
+AUTH_USER = os.getenv("RADIO_AUTH_USER", "awcradio")
+AUTH_KEY = os.getenv("RADIO_SESSION_SECRET", "")
+LOCAL_HOST = os.getenv("RADIO_LOCAL_HOST", "192.168.8.8:8088")
+SESSION_AGE = 30 * 86400
+if AUTH_PASSWORD and len(AUTH_KEY) < 32:
+    raise RuntimeError("RADIO_SESSION_SECRET must contain at least 32 characters")
+def equal(a, b):
+    return hmac.compare_digest(a.encode(), b.encode())
+def credentials(u, p):
+    return equal(u, AUTH_USER) & equal(p, AUTH_PASSWORD)
+def session_token():
+    payload = str(int(time.time()) + SESSION_AGE) + "." + secrets.token_hex(16)
+    return payload + "." + hmac.new(AUTH_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+def valid_session(token):
+    try:
+        expiry, nonce, sig = token.split(".")
+        expected = hmac.new(AUTH_KEY.encode(), (expiry+"."+nonce).encode(), hashlib.sha256).hexdigest()
+        return int(expiry) > time.time() and equal(sig, expected)
+    except (ValueError, TypeError):
+        return False
+LOGIN = """<!doctype html><html><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#11131b"><title>AWC Radio Login</title><style>body{background:#11131b;color:white;font:17px system-ui;display:grid;place-items:center;min-height:90vh}form{width:min(85vw,340px)}input,button{box-sizing:border-box;width:100%;padding:14px;margin:8px 0;border-radius:9px;font:inherit}button{background:#e9ad60;border:0}h1{color:#e9ad60}</style><form method="post" action="/login"><h1>AWC RADIO</h1><p>Sign in to your radio</p><input name="username" autocomplete="username" placeholder="Username" required><input name="password" type="password" autocomplete="current-password" placeholder="Password" required><button>Sign in for 30 days</button></form></html>"""
+@app.middleware("http")
+async def remote_auth(request: Request, call_next):
+    if not AUTH_PASSWORD:
+        return await call_next(request)
+    # NPM must overwrite X-AWC-Remote on every public request.
+    local = (request.headers.get("host","").lower() == LOCAL_HOST.lower()
+             and not request.headers.get("x-awc-remote")
+             and not request.headers.get("x-forwarded-for")
+             and not request.headers.get("forwarded"))
+    if local:
+        return await call_next(request)
+    path = request.url.path
+    if path in ("/icon.svg", "/manifest.webmanifest"):
+        return await call_next(request)
+    if path == "/login" and request.method == "POST":
+        if request.headers.get("origin") != "https://" + request.headers.get("host",""):
+            return HTMLResponse("Invalid origin", status_code=403)
+        if request.headers.get("content-type","").split(";")[0] != "application/x-www-form-urlencoded":
+            return HTMLResponse("Invalid form", status_code=400)
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body)>4096:
+                return HTMLResponse("Form too large", status_code=413)
+        fields = parse_qs(body.decode("utf-8", errors="replace"))
+        if credentials(fields.get("username",[""])[0], fields.get("password",[""])[0]):
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie("awc_session", session_token(), max_age=SESSION_AGE, secure=True, httponly=True, samesite="strict")
+            response.headers["Cache-Control"]="no-store"
+            return response
+        await asyncio.sleep(1)
+        return HTMLResponse(LOGIN.replace("Sign in to your radio","Incorrect username or password"), status_code=401, headers={"Cache-Control":"no-store"})
+    if path == "/logout" and request.method == "POST":
+        response = RedirectResponse("/", status_code=303)
+        response.delete_cookie("awc_session", secure=True, httponly=True, samesite="strict")
+        return response
+    auth = request.headers.get("authorization","")
+    basic = False
+    if auth.lower().startswith("basic "):
+        try:
+            u,p = base64.b64decode(auth[6:], validate=True).decode().split(":",1)
+            basic = credentials(u,p)
+        except (ValueError, UnicodeError):
+            pass
+    if basic or valid_session(request.cookies.get("awc_session","")):
+        return await call_next(request)
+    if path == "/" or path == "/login":
+        return HTMLResponse(LOGIN, headers={"Cache-Control":"no-store"})
+    return JSONResponse({"detail":"Authentication required"}, status_code=401, headers={"Cache-Control":"no-store"})
+
+
 state = {"status": "starting", "error": None, "index": None}
 state_lock = threading.Lock()
 tracks_lock = threading.Lock()
