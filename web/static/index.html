@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#11131b"><title>AWC Radio Web</title>
+<style>
+*{box-sizing:border-box}body{font:16px system-ui,-apple-system,sans-serif;background:#11131b;color:#f5f5fa;max-width:900px;margin:auto;padding:20px 18px 145px}
+h1{color:#ff7458;font-size:1.8rem}p{color:#aab2c1}
+#stations{display:grid;grid-template-columns:repeat(auto-fill,minmax(137px,1fr));gap:12px}
+.station{border:1px solid #32394a;border-radius:13px;background:#212633;color:white;padding:14px 7px;min-height:150px;cursor:pointer;font:inherit}
+.station[aria-pressed="true"]{border-color:#ff7458;background:#373043}
+.station img{display:block;object-fit:contain;height:90px;width:90px;margin:0 auto 9px}
+.station span{display:block;font-size:14px}
+footer{position:fixed;bottom:0;left:0;right:0;background:#1c2230;border-top:1px solid #394052;padding:15px 18px max(15px,env(safe-area-inset-bottom))}
+#controls{max-width:900px;margin:auto;display:flex;align-items:center;gap:13px}
+#logo{width:58px;height:58px;object-fit:contain}#track{color:#aab2c1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.info{min-width:0;flex:1}button#play{width:54px;height:54px;border:0;border-radius:50%;font-size:20px;background:#ff7458;cursor:pointer}
+</style></head>
+<body><h1>📻 AWC Radio Web</h1><p>Radio from your own RPF9 archive, streamed over your network.</p>
+<p id="status">Starting…</p><main id="stations"></main>
+<footer><div id="controls"><img id="logo" alt="" hidden><div class="info">
+<strong id="station-name">Choose a station</strong><div id="track">Live radio</div></div>
+<button id="play" aria-label="Play or pause">▶</button></div></footer><audio id="audio" preload="none"></audio>
+<script>
+const list=document.querySelector("#stations"), audio=document.querySelector("#audio"),button=document.querySelector("#play");
+const title=document.querySelector("#station-name"),track=document.querySelector("#track"),logo=document.querySelector("#logo");
+let current="";
+const path=(s)=>"/api/stations/"+encodeURIComponent(s);
+async function metadata(){
+ if(!current)return;
+ try{let r=await fetch(path(current)+"/now");if(!r.ok)return;let d=await r.json();
+ track.textContent=(d.title||d.kind)+(d.artist?" — "+d.artist:"");}catch(e){}
+}
+function choose(name){
+ current=name;title.textContent=name;logo.src="/api/logo/"+encodeURIComponent(name);logo.hidden=false;
+ for(const b of list.children)b.setAttribute("aria-pressed",String(b.dataset.name===name));
+ audio.src=path(name)+"/stream";audio.play().then(()=>button.textContent="❚❚").catch(()=>{button.textContent="▶";track.textContent="Tap Play to start"});
+ metadata();
+}
+button.onclick=()=>{
+ if(!current)return;
+ if(audio.paused){if(!audio.src)audio.src=path(current)+"/stream";audio.play().then(()=>button.textContent="❚❚").catch(()=>{});}
+ else{audio.pause();audio.removeAttribute("src");audio.load();button.textContent="▶";}
+};
+logo.onerror=()=>logo.hidden=true;
+function render(stations){
+ for(let s of stations){
+ const b=document.createElement("button");b.className="station";b.dataset.name=s.name;b.setAttribute("aria-pressed","false");
+ const img=document.createElement("img");img.alt="";img.src="/api/logo/"+encodeURIComponent(s.name);
+ img.onerror=()=>img.replaceWith(Object.assign(document.createElement("div"),{textContent:"♫"}));
+ const span=document.createElement("span");span.textContent=s.name;b.append(img,span);b.onclick=()=>choose(s.name);list.append(b);
+ }
+}
+async function poll(){
+ try{const r=await fetch("/api/status");const s=await r.json();
+ document.querySelector("#status").textContent=s.status==="ready"?s.station_count+" stations ready":s.status==="error"?"Error: "+s.error:"Indexing archive (first scan may take minutes)…";
+ if(s.status==="ready"&&!list.children.length){let z=await fetch("/api/stations");render(await z.json());}
+ }catch(e){document.querySelector("#status").textContent="Unable to reach server"}
+}
+poll();setInterval(poll,5000);setInterval(metadata,5000);
+</script></body></html>

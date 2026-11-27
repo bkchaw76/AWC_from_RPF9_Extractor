@@ -1,0 +1,17 @@
+services:
+  awc-radio-web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    container_name: awc-radio-web
+    ports:
+      - "8088:8088"
+    volumes:
+      # Change this to the actual host folder containing audio.rpf.
+      - /mnt/nas-downloads/GTA6:/game:ro
+      - ./awc-web-cache:/cache
+    environment:
+      TZ: Asia/Singapore
+      GAME_DIR: /game
+      APPDATA: /cache
+    restart: unless-stopped
