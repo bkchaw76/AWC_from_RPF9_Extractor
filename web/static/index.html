@@ -23,24 +23,28 @@ footer{position:fixed;bottom:0;left:0;right:0;background:#1c2230;border-top:1px 
 <script>
 const list=document.querySelector("#stations"), audio=document.querySelector("#audio"),button=document.querySelector("#play");
 const title=document.querySelector("#station-name"),track=document.querySelector("#track"),logo=document.querySelector("#logo");
-let current="";
+let current="", wanted=false, retry=null, generation=0;
+const media=navigator.mediaSession;
+function cancelRetry(){clearTimeout(retry);retry=null;}
+function stop(){wanted=false;generation++;cancelRetry();audio.pause();audio.removeAttribute("src");audio.load();button.textContent="▶";if(media)media.playbackState="paused";}
+function start(){if(!current)return;wanted=true;cancelRetry();const g=++generation;audio.src=path(current)+"/stream";audio.play().then(()=>{if(g===generation){button.textContent="❚❚";if(media)media.playbackState="playing";}}).catch(()=>{if(g===generation){button.textContent="▶";track.textContent="Tap Play to start";}});}
+function reconnect(){if(!wanted||retry)return;retry=setTimeout(()=>{retry=null;if(wanted)start();},2000);}
+audio.addEventListener("error",reconnect);audio.addEventListener("ended",reconnect);
+if(media){for(const [action,fn] of [["play",start],["pause",stop],["stop",stop]]){try{media.setActionHandler(action,fn)}catch(e){}}}
 const path=(s)=>"/api/stations/"+encodeURIComponent(s);
 async function metadata(){
  if(!current)return;
- try{let r=await fetch(path(current)+"/now");if(!r.ok)return;let d=await r.json();
- track.textContent=(d.title||d.kind)+(d.artist?" — "+d.artist:"");}catch(e){}
+ try{const selected=current;let r=await fetch(path(selected)+"/now");if(!r.ok)return;let d=await r.json();if(selected!==current)return;
+ track.textContent=(d.title||d.kind)+(d.artist?" — "+d.artist:"");
+ if(media&&window.MediaMetadata){try{media.metadata=new MediaMetadata({title:d.title||d.kind||current,artist:d.artist||current,album:current,artwork:[{src:new URL("/api/logo/"+encodeURIComponent(current),location.href).href,type:"image/png"}]});}catch(e){}}}catch(e){}
 }
 function choose(name){
  current=name;title.textContent=name;logo.src="/api/logo/"+encodeURIComponent(name);logo.hidden=false;
  for(const b of list.children)b.setAttribute("aria-pressed",String(b.dataset.name===name));
- audio.src=path(name)+"/stream";audio.play().then(()=>button.textContent="❚❚").catch(()=>{button.textContent="▶";track.textContent="Tap Play to start"});
+ start();
  metadata();
 }
-button.onclick=()=>{
- if(!current)return;
- if(audio.paused){if(!audio.src)audio.src=path(current)+"/stream";audio.play().then(()=>button.textContent="❚❚").catch(()=>{});}
- else{audio.pause();audio.removeAttribute("src");audio.load();button.textContent="▶";}
-};
+button.onclick=()=>{if(!current)return;if(wanted&&!audio.paused)stop();else start();};
 logo.onerror=()=>logo.hidden=true;
 function render(stations){
  for(let s of stations){
