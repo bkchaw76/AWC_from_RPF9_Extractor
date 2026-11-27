@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#11131b"><title>AWC Radio Web</title>
+<meta name="theme-color" content="#11131b"><title>AWC Radio Web</title><link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/icon.svg"><meta name="apple-mobile-web-app-capable" content="yes">
 <style>
 *{box-sizing:border-box}body{font:16px system-ui,-apple-system,sans-serif;background:#11131b;color:#f5f5fa;max-width:900px;margin:auto;padding:20px 18px 145px}
 h1{color:#ff7458;font-size:1.8rem}p{color:#aab2c1}
@@ -14,51 +14,73 @@ footer{position:fixed;bottom:0;left:0;right:0;background:#1c2230;border-top:1px 
 #controls{max-width:900px;margin:auto;display:flex;align-items:center;gap:13px}
 #logo{width:58px;height:58px;object-fit:contain}#track{color:#aab2c1;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .info{min-width:0;flex:1}button#play{width:54px;height:54px;border:0;border-radius:50%;font-size:20px;background:#ff7458;cursor:pointer}
-</style></head>
+nav{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}nav button,.episode,.fav{background:#30374a;color:white;border:0;border-radius:10px;padding:12px;font:inherit;cursor:pointer}nav button.active{background:#ff7458;color:#11131b}.station-wrap{position:relative}.station-wrap .station{width:100%}.fav{position:absolute;right:5px;top:5px;padding:6px;background:#11131b}.wheel{grid-template-columns:repeat(3,1fr)!important;max-width:600px;margin:auto}.wheel .station{border-radius:50%;min-height:110px;padding:8px}.wheel .station img{width:55px;height:55px}.episode{display:block;width:100%;text-align:left;margin:8px 0}#seek{width:100%}#podcontrols{max-width:900px;margin:auto}#search{width:100%;padding:12px;border-radius:10px;background:#212633;color:white;border:1px solid #394052;font:inherit}body{padding-bottom:210px}</style></head>
 <body><h1>📻 AWC Radio Web</h1><p>Radio from your own RPF9 archive, streamed over your network.</p>
-<p id="status">Starting…</p><main id="stations"></main>
+<p id="status">Starting…</p><nav id="tabs"><button data-tab="radio">Radio</button><button data-tab="favorites">★ Favourites</button><button data-tab="podcasts">Podcasts</button><button data-tab="history">History</button><button data-tab="settings">Settings</button></nav><input id="search" placeholder="Find a station" aria-label="Find a station"><main id="stations"></main><section id="panel" hidden></section>
 <footer><div id="controls"><img id="logo" alt="" hidden><div class="info">
 <strong id="station-name">Choose a station</strong><div id="track">Live radio</div></div>
-<button id="play" aria-label="Play or pause">▶</button></div></footer><audio id="audio" preload="none"></audio>
+<button id="play" aria-label="Play or pause">▶</button></div><div id="podcontrols" hidden><input type="range" id="seek" min="0" max="1" step="1" value="0" aria-label="Episode position"><button id="back">−15s</button> <span id="elapsed"></span> <button id="forward">+30s</button></div></footer><audio id="audio" preload="none"></audio>
 <script>
 const list=document.querySelector("#stations"), audio=document.querySelector("#audio"),button=document.querySelector("#play");
 const title=document.querySelector("#station-name"),track=document.querySelector("#track"),logo=document.querySelector("#logo");
-let current="", wanted=false, retry=null, generation=0;
+let current="", wanted=false, retry=null, generation=0, episode=null;
 const media=navigator.mediaSession;
 function cancelRetry(){clearTimeout(retry);retry=null;}
-function stop(){wanted=false;generation++;cancelRetry();audio.pause();audio.removeAttribute("src");audio.load();button.textContent="▶";if(media)media.playbackState="paused";}
-function start(){if(!current)return;wanted=true;cancelRetry();const g=++generation;audio.src=path(current)+"/stream";audio.play().then(()=>{if(g===generation){button.textContent="❚❚";if(media)media.playbackState="playing";}}).catch(()=>{if(g===generation){button.textContent="▶";track.textContent="Tap Play to start";}});}
-function reconnect(){if(!wanted||retry)return;retry=setTimeout(()=>{retry=null;if(wanted)start();},2000);}
+function stop(){if(episode){savePosition();audio.pause();wanted=false;button.textContent="▶";if(media)media.playbackState="paused";return;}wanted=false;generation++;cancelRetry();audio.pause();audio.removeAttribute("src");audio.load();button.textContent="▶";if(media)media.playbackState="paused";}
+function start(){if(episode){wanted=true;audio.play().then(()=>{button.textContent="❚❚";if(media)media.playbackState="playing";}).catch(()=>{wanted=false;track.textContent="Tap Play to start";});return;}if(!current)return;wanted=true;cancelRetry();const g=++generation;audio.src=path(current)+"/stream";audio.play().then(()=>{if(g===generation){button.textContent="❚❚";if(media)media.playbackState="playing";}}).catch(()=>{if(g===generation){button.textContent="▶";track.textContent="Tap Play to start";}});}
+function reconnect(){if(episode||!wanted||retry)return;retry=setTimeout(()=>{retry=null;if(wanted)start();},2000);}
 audio.addEventListener("error",reconnect);audio.addEventListener("ended",reconnect);
 if(media){for(const [action,fn] of [["play",start],["pause",stop],["stop",stop]]){try{media.setActionHandler(action,fn)}catch(e){}}}
 const path=(s)=>"/api/stations/"+encodeURIComponent(s);
 async function metadata(){
- if(!current)return;
- try{const selected=current;let r=await fetch(path(selected)+"/now");if(!r.ok)return;let d=await r.json();if(selected!==current)return;
- track.textContent=(d.title||d.kind)+(d.artist?" — "+d.artist:"");
+ if(!current||episode)return;
+ try{const selected=current;let r=await fetch(path(selected)+"/now");if(!r.ok)return;let d=await r.json();if(selected!==current||episode)return;
+ track.textContent=(d.title||d.kind)+(d.artist?" — "+d.artist:"");if(wanted&&d.title)record(d);
  if(media&&window.MediaMetadata){try{media.metadata=new MediaMetadata({title:d.title||d.kind||current,artist:d.artist||current,album:current,artwork:[{src:new URL("/api/logo/"+encodeURIComponent(current),location.href).href,type:"image/png"}]});}catch(e){}}}catch(e){}
 }
 function choose(name){
- current=name;title.textContent=name;logo.src="/api/logo/"+encodeURIComponent(name);logo.hidden=false;
- for(const b of list.children)b.setAttribute("aria-pressed",String(b.dataset.name===name));
+ if(episode){savePosition();episode=null;document.querySelector("#podcontrols").hidden=true;}current=name;title.textContent=name;logo.src="/api/logo/"+encodeURIComponent(name);logo.hidden=false;
+ for(const b of list.querySelectorAll(".station"))b.setAttribute("aria-pressed",String(b.dataset.name===name));
  start();
  metadata();
 }
-button.onclick=()=>{if(!current)return;if(wanted&&!audio.paused)stop();else start();};
+button.onclick=()=>{if(!current&&!episode)return;if(wanted&&!audio.paused)stop();else start();};
 logo.onerror=()=>logo.hidden=true;
 function render(stations){
+ list.replaceChildren();
  for(let s of stations){
- const b=document.createElement("button");b.className="station";b.dataset.name=s.name;b.setAttribute("aria-pressed","false");
+ const b=document.createElement("button");b.className="station";b.dataset.name=s.name;b.setAttribute("aria-pressed",String(s.name===current&&!episode));
  const img=document.createElement("img");img.alt="";img.src="/api/logo/"+encodeURIComponent(s.name);
  img.onerror=()=>img.replaceWith(Object.assign(document.createElement("div"),{textContent:"♫"}));
- const span=document.createElement("span");span.textContent=s.name;b.append(img,span);b.onclick=()=>choose(s.name);list.append(b);
+ const span=document.createElement("span");span.textContent=s.name;b.append(img,span);b.onclick=()=>choose(s.name);const wrap=document.createElement("div");wrap.className="station-wrap";const f=document.createElement("button");f.className="fav";f.textContent=favorites.includes(s.name)?"★":"☆";f.setAttribute("aria-label","Toggle favourite "+s.name);f.onclick=()=>{favorites=favorites.includes(s.name)?favorites.filter(n=>n!==s.name):[...favorites,s.name];store("favorites",favorites);showRadio();};wrap.append(b,f);list.append(wrap);
  }
 }
 async function poll(){
  try{const r=await fetch("/api/status");const s=await r.json();
  document.querySelector("#status").textContent=s.status==="ready"?s.station_count+" stations ready":s.status==="error"?"Error: "+s.error:"Indexing archive (first scan may take minutes)…";
- if(s.status==="ready"&&!list.children.length){let z=await fetch("/api/stations");render(await z.json());}
+ if(s.status==="ready"&&!allStations.length){let z=await fetch("/api/stations");allStations=await z.json();if(tab==="radio"||tab==="favorites")showRadio();}
  }catch(e){document.querySelector("#status").textContent="Unable to reach server"}
 }
+const panel=document.querySelector("#panel"), search=document.querySelector("#search"), seek=document.querySelector("#seek");
+function read(k,d){try{return JSON.parse(localStorage.getItem("awc."+k))??d}catch(e){return d}}
+function store(k,v){try{localStorage.setItem("awc."+k,JSON.stringify(v))}catch(e){}}
+let favorites=read("favorites",[]),history=read("history",[]),positions=read("positions",{}),allStations=[],tab="radio",wheel=read("wheel",false);
+function record(d){let key=d.station+"|"+d.start+"|"+d.title;if(history[0]?.key===key)return;history.unshift({key,title:d.title,artist:d.artist,station:d.station,time:Date.now()});history=history.slice(0,100);store("history",history);}
+function showRadio(){list.classList.toggle("wheel",wheel);render(allStations.filter(s=>(tab!=="favorites"||favorites.includes(s.name))&&s.name.toLowerCase().includes(search.value.toLowerCase())));}
+function add(tag,txt,parent=panel){let e=document.createElement(tag);e.textContent=txt;parent.append(e);return e;}
+function fmt(n){n=Math.floor(n||0);return Math.floor(n/60)+":"+String(n%60).padStart(2,"0")}
+function savePosition(){if(episode&&Number.isFinite(audio.currentTime)){positions[episode.key]=audio.currentTime;store("positions",positions);}}
+function openEpisode(show,e){if(episode)savePosition();else stop();cancelRetry();generation++;current="";episode={key:show+"|"+e.id,show,e};title.textContent=show;track.textContent=e.title;logo.hidden=true;document.querySelector("#podcontrols").hidden=false;audio.src="/api/podcasts/"+encodeURIComponent(show)+"/"+e.id+"/audio";const selected=episode;audio.addEventListener("loadedmetadata",()=>{if(episode===selected){let p=positions[selected.key]||0;if(p<audio.duration-5)audio.currentTime=p;}},{once:true});if(media&&window.MediaMetadata)media.metadata=new MediaMetadata({title:e.title,artist:show,album:show});start();}
+audio.addEventListener("timeupdate",()=>{if(episode){seek.max=Number.isFinite(audio.duration)?audio.duration:episode.e.duration;seek.value=audio.currentTime;document.querySelector("#elapsed").textContent=fmt(audio.currentTime)+" / "+fmt(seek.max);}});
+audio.addEventListener("ended",()=>{if(episode){positions[episode.key]=0;store("positions",positions);wanted=false;button.textContent="▶";}});
+seek.onchange=()=>{if(episode)audio.currentTime=Number(seek.value)};
+document.querySelector("#back").onclick=()=>{if(episode)audio.currentTime=Math.max(0,audio.currentTime-15)};
+document.querySelector("#forward").onclick=()=>{if(episode&&Number.isFinite(audio.duration))audio.currentTime=Math.min(audio.duration,audio.currentTime+30)};
+setInterval(()=>{if(episode&&!audio.paused)savePosition()},5000);window.addEventListener("pagehide",savePosition);
+async function switchTab(t){tab=t;for(const b of document.querySelectorAll("#tabs button"))b.classList.toggle("active",b.dataset.tab===t);let radio=t==="radio"||t==="favorites";list.hidden=!radio;list.style.display=radio?"":"none";search.hidden=!radio;panel.hidden=radio;panel.replaceChildren();if(radio){showRadio();return;}
+if(t==="history"){add("h2","Recently played");for(const h of history){add("p",h.title+" — "+(h.artist||"")+" · "+h.station);}if(!history.length)add("p","No listening history yet.");}
+if(t==="podcasts"){add("h2","Podcasts");try{let shows=await (await fetch("/api/podcasts")).json();if(tab!==t)return;for(const show of shows){add("h3",show.name);for(const e of show.episodes){let b=add("button",e.title+" · "+fmt(e.duration)+(positions[show.name+"|"+e.id]?" · Resume "+fmt(positions[show.name+"|"+e.id]):""));b.className="episode";b.onclick=()=>openEpisode(show.name,e);}}if(!shows.length)add("p","No podcasts indexed.");}catch(e){add("p","Unable to load podcasts.");}}
+if(t==="settings"){add("h2","Settings");let b=add("button",wheel?"Use grid layout":"Use compact radio layout");b.className="episode";b.onclick=()=>{wheel=!wheel;store("wheel",wheel);switchTab("settings")};try{let s=await (await fetch("/api/settings")).json();if(tab!==t)return;add("p","Server bitrate: "+s.bitrate+" kbps");add("p","DJ overlays: "+(s.dj?"On":"Off"));add("p","Content: "+s.content.join(", "));add("p","Server audio settings are managed in Dockhand to keep shared streams consistent.");}catch(e){add("p","Server settings unavailable.");}add("p","iPhone: Safari → Share → Add to Home Screen.");}}
+search.oninput=showRadio;for(const b of document.querySelectorAll("#tabs button"))b.onclick=()=>switchTab(b.dataset.tab);switchTab("radio");
 poll();setInterval(poll,5000);setInterval(metadata,5000);
 </script></body></html>
