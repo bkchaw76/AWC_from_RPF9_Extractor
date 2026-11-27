@@ -341,3 +341,44 @@ def stream(name: str):
     station(name)
     return StreamingResponse(shared_stream(name), media_type="audio/mpeg",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
+@app.get("/api/podcasts")
+def podcasts():
+    with state_lock:
+        idx = state["index"]
+    return [{"name": name, "episodes": [{"id": i, "title": e.get("name") or "Episode %d" % (i+1), "duration": e["sec"]} for i,e in enumerate(show["songs"])]} for name,show in (idx or {}).get("podcasts", {}).items()]
+
+@app.get("/api/podcasts/{name}/{episode}/audio")
+def podcast_audio(name: str, episode: int):
+    with state_lock:
+        idx = state["index"]
+    if idx is None:
+        raise HTTPException(503, "Indexing")
+    songs = idx.get("podcasts", {}).get(name, {}).get("songs", [])
+    if not 0 <= episode < len(songs):
+        raise HTTPException(404, "Episode not found")
+    src = track_file(idx, songs[episode])
+    dest = src.with_suffix(".m4a")
+    with podcast_lock:
+        if not dest.exists() or not dest.stat().st_size:
+            tmp = dest.with_suffix(".tmp.m4a")
+            try:
+                subprocess.run(["ffmpeg","-nostdin","-loglevel","error","-y","-i",str(src),"-vn","-c:a","aac","-b:a","128k","-movflags","+faststart",str(tmp)],check=True)
+                os.replace(tmp,dest)
+            finally:
+                tmp.unlink(missing_ok=True)
+    return FileResponse(dest, media_type="audio/mp4")
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    return FileResponse(ROOT / "web/static/manifest.webmanifest", media_type="application/manifest+json")
+
+@app.get("/icon.svg")
+def app_icon():
+    return FileResponse(ROOT / "web/static/icon.svg", media_type="image/svg+xml")
+
+@app.get("/api/settings")
+def settings():
+    return {"bitrate": BITRATE, "dj": DJ, "content": CONTENT}
+
+podcast_lock = threading.Lock()
