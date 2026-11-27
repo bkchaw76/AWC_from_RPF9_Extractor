@@ -119,7 +119,12 @@ def current_item(sched, now):
 
 @app.get("/api/logo/{name}")
 def logo(name: str):
-    station(name)
+    with state_lock:
+        idx = state["index"]
+    if idx is None:
+        raise HTTPException(503, "Indexing")
+    if name not in idx["stations"] and name not in idx.get("podcasts", {}):
+        raise HTTPException(404, "Unknown station or podcast")
     path = icons.icon_path(name)
     if not path:
         raise HTTPException(404, "Logo not found")
