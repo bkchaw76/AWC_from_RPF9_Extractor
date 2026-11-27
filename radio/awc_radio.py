@@ -897,6 +897,7 @@ class Schedule:
                     if isinstance(f, list) and f[0] == "s":
                         heard[f[1]] = -float(_h(name, d, "heard", f[1]) % 3600)
         starts, entries = [], []
+        talk_heard = {}  # recording key -> last scheduled end, within UTC day
         recent, place = {}, {}                                 # category -> keys just heard / the next in its order
         current, run, previous = "", 0, ""
         aired = ""                                             # the category of the last item that went on air
@@ -906,8 +907,19 @@ class Schedule:
             allowed = {c for c, v in self.pools.items() if any(x[2] <= self.enabled for x in v)} if passed >= 20 else None
             if allowed is not None and not allowed:
                 break
+            # Only standalone talk is subject to the two-hour cooldown.
+            eligible = {
+                c: [x for x in v if (allowed is None or x[2] <= self.enabled)
+                    and (x[0] != "talk" or now - talk_heard.get(_tkey(x[1]), -1e9) >= 7200)]
+                for c, v in self.pools.items() if allowed is None or c in allowed
+            }
+            eligible = {c: v for c, v in eligible.items() if v}
+            if not eligible:
+                break
+            if len(eligible) != len(self.pools) or allowed is not None:
+                allowed = set(eligible)
             category = self._next_category(d, step, current, run, heard, now, hour_of(d * DAY + now), allowed)
-            pool = self.pools[category]
+            pool = eligible[category]
             if allowed is not None:
                 pool = [x for x in pool if x[2] <= self.enabled]
             if category in sequence:
@@ -920,6 +932,7 @@ class Schedule:
                 keep = min(history.get(category, len(pool) * 2 // 3), len(pool) - 1)
                 last = recent.setdefault(category, [])
                 free = [x for x in pool if _tkey(x[1]) not in last]
+                free = free or pool  # cooldown can leave only items in category history
                 free = [x for x in free if _tkey(x[1]) != previous] or free
                 kind, tr_, what = free[_h(name, d, "item", category, step) % len(free)]
                 last.append(_tkey(tr_))
@@ -932,6 +945,8 @@ class Schedule:
                 if not self._add(starts, entries, kind, tr_, d, aired, category):
                     break
                 now = starts[-1] + max(1.0, tr_["sec"])
+                if kind == "talk":
+                    talk_heard[_tkey(tr_)] = now
                 previous, aired = _tkey(tr_), category
                 if now >= DAY:
                     break
