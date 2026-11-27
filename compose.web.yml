@@ -14,4 +14,8 @@ services:
       TZ: Asia/Singapore
       GAME_DIR: /game
       APPDATA: /cache
+      RADIO_AUTH_USER: ${RADIO_AUTH_USER:-awcradio}
+      RADIO_AUTH_PASSWORD: ${RADIO_AUTH_PASSWORD:-}
+      RADIO_SESSION_SECRET: ${RADIO_SESSION_SECRET:-}
+      RADIO_LOCAL_HOST: ${RADIO_LOCAL_HOST:-192.168.8.8:8088}
     restart: unless-stopped
