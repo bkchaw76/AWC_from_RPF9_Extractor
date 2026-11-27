@@ -1,0 +1,24 @@
+name: Linux Web Radio Build
+on:
+  push:
+    branches: [feature/linux-web-radio]
+  pull_request:
+    paths:
+      - 'web/**'
+      - 'compose.web.yml'
+      - 'radio/**'
+      - 'extractor/**'
+      - '.github/workflows/web-radio.yml'
+  workflow_dispatch:
+jobs:
+  syntax-and-container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Python syntax
+        run: python3 -m compileall -q web
+      - name: Build Linux Docker image
+        run: docker build -f web/Dockerfile -t awc-radio-web:test .
+      - name: Check API can import (without game archives)
+        run: |
+          docker run --rm --entrypoint python3 awc-radio-web:test -c "import web.app; print('Web API import OK')"
