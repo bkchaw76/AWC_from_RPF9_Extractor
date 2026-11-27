@@ -133,10 +133,28 @@ def logo(name: str):
 @app.get("/api/stations/{name}/now")
 def now_playing(name: str):
     idx, sched = station(name)
-    start, end, kind, track, _, _ = current_item(sched, time.time())
-    seg = segment_at(track, max(0, time.time()-start))
+    now = time.time()
+    with schedule_lock:
+        upcoming = sched.items_from(now, 40)
+    start, end, kind, track, _, _ = upcoming[0]
+    seg = segment_at(track, max(0, now-start))
+    next_song = None
+    for part in track.get("m", []):
+        if kind == "song" and now < start + part[0] < end and part[1]:
+            next_song = {"title": part[1], "artist": part[2]}
+            break
+    if next_song is None:
+        for a, b, k, tr, _, _ in upcoming[1:]:
+            if k != "song":
+                continue
+            first = segment_at(tr, 0)
+            title = (first[1] if first and first[1] else tr.get("title", ""))
+            artist = (first[2] if first and first[1] else tr.get("artist", ""))
+            if title:
+                next_song = {"title": title, "artist": artist}
+                break
     return {"station": name, "kind": kind, "title": (seg[1] if seg and seg[1] else track.get("title", "")),
-            "artist": (seg[2] if seg and seg[1] else track.get("artist", "")), "start": start, "end": end}
+            "artist": (seg[2] if seg and seg[1] else track.get("artist", "")), "start": start, "end": end, "next_song": next_song}
 
 def track_file(idx, tr):
     dest = Path(cache_dir()) / ("r_" + _tkey(tr) + ".opus")
