@@ -1,4 +1,6 @@
 """Experimental headless web radio player using upstream AWC's indexing and schedules."""
+import asyncio
+import queue
 import json
 import os
 import subprocess
@@ -23,6 +25,10 @@ app = FastAPI(title="AWC Radio Web")
 state = {"status": "starting", "error": None, "index": None}
 state_lock = threading.Lock()
 tracks_lock = threading.Lock()
+schedule_lock = threading.Lock()
+schedules = {}
+hubs_lock = threading.Lock()
+hubs = {}
 
 def load_credits():
     cache = Path(credits_cache_path())
@@ -95,7 +101,14 @@ def station(name):
         raise HTTPException(503, "Indexing has not completed")
     if name not in idx["stations"]:
         raise HTTPException(404, "Station not found")
-    return idx, Schedule(name, idx["stations"][name], content=False, news=idx.get("news", []))
+    with schedule_lock:
+        if name not in schedules:
+            schedules[name] = Schedule(name, idx["stations"][name], content=False, news=idx.get("news", []))
+        return idx, schedules[name]
+
+def current_item(sched, now):
+    with schedule_lock:
+        return sched.items_from(now, 1)[0]
 
 @app.get("/api/logo/{name}")
 def logo(name: str):
@@ -108,7 +121,7 @@ def logo(name: str):
 @app.get("/api/stations/{name}/now")
 def now_playing(name: str):
     idx, sched = station(name)
-    start, end, kind, track, _, _ = sched.items_from(time.time(), 1)[0]
+    start, end, kind, track, _, _ = current_item(sched, time.time())
     return {"station": name, "kind": kind, "title": track.get("title", ""),
             "artist": track.get("artist", ""), "start": start, "end": end}
 
@@ -126,17 +139,19 @@ def track_file(idx, tr):
                     os.unlink(tmp)
     return dest
 
-def mp3_stream(name):
+def mp3_stream(name, stop):
     idx, sched = station(name)
     proc = None
     try:
-        while True:
+        while not stop.is_set():
             now = time.time()
-            start, end, kind, track, fin, fout = sched.items_from(now, 1)[0]
+            start, end, kind, track, fin, fout = current_item(sched, now)
             if end <= now + 0.2:
                 time.sleep(.15)
                 continue
             path = track_file(idx, track)
+            if stop.is_set():
+                break
             now = time.time()
             if now >= end - .2:
                 continue
@@ -149,20 +164,99 @@ def mp3_stream(name):
                    "-f", "mp3", "pipe:1"]
             proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            while True:
-                chunk = proc.stdout.read(8192)
+            while not stop.is_set():
+                chunk = proc.stdout.read(4096)
                 if not chunk:
                     break
                 yield chunk
+            if stop.is_set():
+                proc.kill()
             proc.wait()
+            proc.stdout.close()
             proc = None
     finally:
         if proc is not None:
             proc.kill()
             proc.wait()
+            proc.stdout.close()
+
+class StationHub:
+    def __init__(self, name):
+        self.name = name
+        self.stop = threading.Event()
+        self.listeners = set()
+
+    def run(self):
+        generator = mp3_stream(self.name, self.stop)
+        try:
+            for chunk in generator:
+                with hubs_lock:
+                    for listener in list(self.listeners):
+                        try:
+                            listener.put_nowait(chunk)
+                        except queue.Full:
+                            # Disconnect slow clients rather than blocking the station.
+                            self.listeners.discard(listener)
+                            while not listener.empty():
+                                try:
+                                    listener.get_nowait()
+                                except queue.Empty:
+                                    break
+                            listener.put_nowait(None)
+                    if not self.listeners:
+                        self.stop.set()
+        except Exception as exc:
+            print("Station stream failed:", self.name, exc, flush=True)
+        finally:
+            generator.close()
+            with hubs_lock:
+                self.stop.set()
+                for listener in self.listeners:
+                    while not listener.empty():
+                        try:
+                            listener.get_nowait()
+                        except queue.Empty:
+                            break
+                    listener.put_nowait(None)
+                self.listeners.clear()
+                if hubs.get(self.name) is self:
+                    hubs.pop(self.name, None)
+
+async def shared_stream(name):
+    listener = queue.Queue(maxsize=64)
+    with hubs_lock:
+        hub = hubs.get(name)
+        if hub is None or hub.stop.is_set():
+            hub = StationHub(name)
+            hubs[name] = hub
+            hub.listeners.add(listener)
+            threading.Thread(target=hub.run, daemon=True).start()
+        else:
+            hub.listeners.add(listener)
+    try:
+        while True:
+            try:
+                chunk = listener.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(.05)
+                continue
+            if chunk is None:
+                break
+            yield chunk
+    finally:
+        with hubs_lock:
+            hub.listeners.discard(listener)
+            if not hub.listeners:
+                hub.stop.set()
+
+@app.get("/api/streams")
+def active_streams():
+    with hubs_lock:
+        return [{"station": name, "listeners": len(hub.listeners)}
+                for name, hub in hubs.items() if not hub.stop.is_set()]
 
 @app.get("/api/stations/{name}/stream")
 def stream(name: str):
     station(name)
-    return StreamingResponse(mp3_stream(name), media_type="audio/mpeg",
+    return StreamingResponse(shared_stream(name), media_type="audio/mpeg",
                              headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
