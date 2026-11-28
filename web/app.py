@@ -278,7 +278,7 @@ def mix_command(idx, plan, now, end):
         path = track_file(idx, track)
         if loop:
             cmd.extend(["-stream_loop", "-1"])
-        cmd.extend(["-ss", "%.3f" % offset, "-re", "-i", str(path)])
+        cmd.extend(["-ss", "%.3f" % offset, "-i", str(path)])
         label = "a%d" % n
         chain = ["aresample=44100", "aformat=channel_layouts=stereo",
                  "atrim=duration=%.3f" % length,
@@ -317,49 +317,85 @@ def mix_command(idx, plan, now, end):
     filters.append("".join(labels)+"amix=inputs=%d:duration=longest:normalize=0,alimiter=limit=0.89:level=disabled,apad[out]" % n)
     return cmd+["-filter_complex", ";".join(filters), "-map", "[out]",
                 "-t", "%.3f" % duration, "-vn", "-ac", "2", "-ar", "44100",
-                "-c:a", "libmp3lame", "-b:a", BITRATE+"k", "-write_xing", "0",
-                "-id3v2_version", "0", "-f", "mp3", "pipe:1"]
+                "-c:a", "pcm_s16le", "-f", "s16le", "pipe:1"]
 
 def mp3_stream(name, stop):
     idx, sched = station(name)
-    proc = None
+    encoder = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
+         "-c:a", "libmp3lame", "-b:a", BITRATE+"k", "-write_xing", "0",
+         "-id3v2_version", "0", "-flush_packets", "1", "-f", "mp3", "pipe:1"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    errors = []
+    def feed():
+        mixer = None
+        cursor = time.time()
+        deadline = time.monotonic()
+        try:
+            while not stop.is_set():
+                end, plan = programme_window(sched, cursor)
+                if not plan or end-cursor < .001:
+                    cursor = max(cursor+.001, end)
+                    continue
+                mixer = subprocess.Popen(mix_command(idx, plan, cursor, end),
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+                frames = 0
+                target = round((end-cursor)*44100)
+                while not stop.is_set() and frames < target:
+                    data = mixer.stdout.read(min(17640, (target-frames)*4))
+                    if not data:
+                        break
+                    encoder.stdin.write(data)
+                    frames += len(data)//4
+                    deadline += len(data)/176400
+                    stop.wait(max(0, deadline-time.monotonic()))
+                if stop.is_set():
+                    mixer.kill()
+                # Drain any rounding surplus before waiting for the mixer.
+                if not stop.is_set():
+                    mixer.stdout.read()
+                rc = mixer.wait()
+                mixer.stdout.close()
+                mixer = None
+                if rc and not stop.is_set():
+                    raise RuntimeError("FFmpeg mixer exited with code %d" % rc)
+                while frames < target and not stop.is_set():
+                    count = min(4410, target-frames)
+                    encoder.stdin.write(bytes(count*4))
+                    frames += count
+                    deadline += count/44100
+                    stop.wait(max(0, deadline-time.monotonic()))
+                cursor = end
+        except Exception as exc:
+            if not stop.is_set():
+                errors.append(exc)
+        finally:
+            if mixer is not None:
+                mixer.kill()
+                mixer.wait()
+                mixer.stdout.close()
+            try:
+                encoder.stdin.close()
+            except OSError:
+                pass
+    worker = threading.Thread(target=feed, daemon=True)
+    worker.start()
     try:
         while not stop.is_set():
-            now = time.time()
-            end, plan = programme_window(sched, now)
-            if not plan or end-now < .15:
-                stop.wait(.15)
-                continue
-            # Warm the extraction cache before fixing the live offset.
-            for item, voices, bed, _ in plan:
-                track_file(idx, item[3])
-                if bed:
-                    track_file(idx, bed)
-                for _, line in voices:
-                    track_file(idx, {"base":line[0], "idx":line[1], "sec":line[2]})
-            now = time.time()
-            end, plan = programme_window(sched, now)
-            if not plan or end-now < .15 or stop.is_set():
-                continue
-            cmd = mix_command(idx, plan, now, end)
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
-            while not stop.is_set():
-                chunk = proc.stdout.read(4096)
-                if not chunk:
-                    break
-                yield chunk
-            if stop.is_set():
-                proc.kill()
-            rc = proc.wait()
-            proc.stdout.close()
-            proc = None
-            if rc and not stop.is_set():
-                raise RuntimeError("FFmpeg mixer exited with code %d" % rc)
+            chunk = encoder.stdout.read1(4096)
+            if not chunk:
+                break
+            yield chunk
+        if errors:
+            raise errors[0]
     finally:
-        if proc is not None:
-            proc.kill()
-            proc.wait()
-            proc.stdout.close()
+        stop.set()
+        if encoder.poll() is None:
+            encoder.kill()
+        encoder.wait()
+        encoder.stdout.close()
+        worker.join(timeout=5)
 
 class StationHub:
     def __init__(self, name):
