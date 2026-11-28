@@ -276,6 +276,35 @@ def fallback_art(title,artist,key):
             if exc.code!=404:
                 raise
     return False
+def lookup_override_art(title, artist, key):
+    global art_last_query
+    overrides = json.loads((ROOT/"web/artwork_overrides.json").read_text())
+    ids = next((entry["track_ids"] for entry in overrides
+                if match_artist(entry["artist"])==match_artist(artist)
+                and match_title(entry["title"])==match_title(title)), [])
+    for track_id in ids:
+        for country in ("SG","US"):
+            time.sleep(max(0,3.2-(time.monotonic()-art_last_query)))
+            art_last_query = time.monotonic()
+            query = urlencode({"id":track_id,"country":country,"entity":"song"})
+            with urlopen("https://itunes.apple.com/lookup?"+query,timeout=8) as response:
+                items = json.loads(response.read(2000000)).get("results",[])
+            for item in items:
+                if item.get("trackId")!=track_id or match_title(item.get("trackName",""))!=match_title(title) or match_artist(item.get("artistName",""))!=match_artist(artist):
+                    continue
+                url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
+                parsed = urlparse(url)
+                if parsed.scheme!="https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
+                    continue
+                with urlopen(url,timeout=8) as response:
+                    data = response.read(2000001)
+                if len(data)<=2000000 and data.startswith(b"\xff\xd8\xff"):
+                    art_dir.mkdir(parents=True,exist_ok=True)
+                    tmp = art_dir/(key+".tmp")
+                    tmp.write_bytes(data)
+                    os.replace(tmp,art_dir/(key+".jpg"))
+                    return True
+    return False
 def fetch_art(title, artist, key):
     failed = False
     try:
@@ -321,6 +350,11 @@ def fetch_art(title, artist, key):
                 except Exception:
                     failed = True
                     continue
+        try:
+            if lookup_override_art(title,artist,key):
+                return
+        except Exception:
+            failed = True
         fallback_art(title,artist,key)
     except Exception:
         failed = True
