@@ -231,15 +231,56 @@ def match_title(value):
     value = re.sub(r"\s*(?:[-–—]\s*|[\(\[]\s*)(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?\s*[)\]]?\s*$", "", value, flags=re.I)
     return art_norm(value)
 art_last_query = 0.0
+art_errors = set()
 def search_art(term, country):
     global art_last_query
     time.sleep(max(0, 3.2-(time.monotonic()-art_last_query)))
     art_last_query = time.monotonic()
-    query = urlencode({"term":term,"entity":"song","limit":25,"country":country})
-    with urlopen("https://itunes.apple.com/search?"+query,timeout=8) as response:
-        return json.loads(response.read(2000000)).get("results",[])
+    query = urlencode({"term":term,"entity":"song","limit":50,"country":country,"explicit":"Yes"})
+    for attempt in range(2):
+        try:
+            with urlopen("https://itunes.apple.com/search?"+query,timeout=8) as response:
+                return json.loads(response.read(2000000)).get("results",[])
+        except Exception:
+            if attempt:
+                raise
+            time.sleep(4)
+            art_last_query = time.monotonic()
+def fallback_art(title,artist,key):
+    from urllib.request import Request as URLRequest
+    query = urlencode({"query":'recording:"'+title.replace('"','')+'" AND artist:"'+artist.replace('"','')+'"',"fmt":"json","limit":10})
+    req = URLRequest("https://musicbrainz.org/ws/2/recording/?"+query,headers={"User-Agent":"AWC-Radio/0.5.5 (https://github.com/bkchaw76/AWC_from_RPF9_Extractor)"})
+    with urlopen(req,timeout=10) as response:
+        recordings = json.loads(response.read(2000000)).get("recordings",[])
+    releases = {}
+    for rec in recordings:
+        credit = "".join(x.get("name","")+x.get("joinphrase","") for x in rec.get("artist-credit",[]))
+        if match_title(rec.get("title",""))!=match_title(title) or match_artist(credit)!=match_artist(artist):
+            continue
+        for rel in rec.get("releases",[]):
+            group = rel.get("release-group",{})
+            if rel.get("status")=="Official" and group.get("primary-type")=="Album" and not group.get("secondary-types"):
+                releases[rel["id"]] = rel.get("date") or "9999"
+    from urllib.error import HTTPError
+    for rid in sorted(releases,key=releases.get)[:5]:
+        try:
+            with urlopen("https://coverartarchive.org/release/"+rid+"/front-500",timeout=10) as response:
+                data = response.read(2000001)
+            if len(data)<=2000000 and data.startswith(b"\xff\xd8\xff"):
+                art_dir.mkdir(parents=True,exist_ok=True)
+                tmp = art_dir/(key+".tmp")
+                tmp.write_bytes(data)
+                os.replace(tmp,art_dir/(key+".jpg"))
+                return True
+        except HTTPError as exc:
+            if exc.code!=404:
+                raise
+    return False
 def fetch_art(title, artist, key):
+    failed = False
     try:
+        if (art_dir/(key+".jpg")).is_file():
+            return
         wanted_artist = match_artist(artist)
         wanted_title = match_title(title)
         # Require matching title and full artist credit, including featured credits
@@ -248,6 +289,7 @@ def fetch_art(title, artist, key):
             try:
                 results = search_art(artist+" "+title,country)
             except Exception:
+                failed = True
                 continue
             matches = []
             for item in results:
@@ -277,11 +319,17 @@ def fetch_art(title, artist, key):
                     os.replace(tmp,art_dir/(key+".jpg"))
                     return
                 except Exception:
+                    failed = True
                     continue
+        fallback_art(title,artist,key)
     except Exception:
-        pass
+        failed = True
     finally:
         with art_lock:
+            if failed and not (art_dir/(key+".jpg")).exists():
+                art_errors.add(key)
+            else:
+                art_errors.discard(key)
             art_pending.discard(key)
             if not (art_dir / (key+".jpg")).exists():
                 art_misses[key] = time.monotonic()+3600
@@ -350,7 +398,7 @@ def bulk_run(items, retry):
         for key,item in items:
             if bulk_pause.is_set():
                 break
-            if not (art_dir/(key+".jpg")).is_file() and (retry or key not in results):
+            if not (art_dir/(key+".jpg")).is_file() and (retry or key not in results or results.get(key)=="error"):
                 # Share the existing single lookup worker with live playback.
                 with art_lock:
                     pending = key in art_pending
@@ -365,7 +413,7 @@ def bulk_run(items, retry):
                         time.sleep(.2)
                 else:
                     future.result()
-                results[key] = "cached" if (art_dir/(key+".jpg")).is_file() else "unmatched"
+                results[key] = "cached" if (art_dir/(key+".jpg")).is_file() else ("error" if key in art_errors else "unmatched")
                 bulk_save(results)
                 if bulk_pause.wait(3.2):
                     break
@@ -379,14 +427,14 @@ def bulk_status():
     library = artwork_library()
     results = bulk_load()
     cached = {k for k in library if (art_dir/(k+".jpg")).is_file()}
-    missing = {k for k in library if k not in cached and results.get(k)=="unmatched"}
+    missing = {k for k in library if k not in cached and results.get(k) in ("unmatched","error")}
     names = list(state["index"]["stations"])
     with bulk_lock:
         progress = dict(bulk_state)
     return dict(progress, unique=len(library), downloaded=len(cached), unmatched=len(missing),
                 stations=[{"name":n,"total":sum(n in v["stations"] for v in library.values()),
                            "cached":sum(n in library[k]["stations"] for k in cached)} for n in names],
-                missing=[library[k] for k in sorted(missing)],
+                missing=[dict(library[k],lookup_status=results.get(k)) for k in sorted(missing)],
                 covers=[dict(library[k],key=k) for k in sorted(cached)[:100]],
                 bytes=sum(p.stat().st_size for p in art_dir.glob("*.jpg")))
 @app.post("/api/artwork-manager/{action}")
