@@ -635,7 +635,7 @@ def mix_command(idx, plan, now, end):
             lo, hi = max(now, begin), min(end, begin+line[2])
             if hi > lo:
                 source({"base":line[0], "idx":line[1], "sec":line[2]},
-                       lo-begin, hi-lo, delay=lo-now)
+                       lo-begin, hi-lo, delay=lo-now, gain=10**(4/20))
     filters.append("".join(labels)+"amix=inputs=%d:duration=longest:normalize=0,alimiter=limit=0.89:level=disabled,apad[out]" % n)
     return cmd+["-filter_complex", ";".join(filters), "-map", "[out]",
                 "-t", "%.3f" % duration, "-vn", "-ac", "2", "-ar", "44100",
