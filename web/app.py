@@ -238,66 +238,46 @@ def search_art(term, country):
     query = urlencode({"term":term,"entity":"song","limit":25,"country":country})
     with urlopen("https://itunes.apple.com/search?"+query,timeout=8) as response:
         return json.loads(response.read(2000000)).get("results",[])
-def art_rank(item):
-    album = item.get("collectionName","").casefold()
-    compilation = bool(re.search(r"greatest hits|best of|collection|anthology|various artists|essential|\b80s\b|\b90s\b|\b70s\b|\bhits\b|soundtrack|compilation",album))
-    edition = bool(re.search(r"deluxe|anniversary|expanded|\bsingle\b|remaster",album))
-    return (compilation, edition, item.get("releaseDate") or "9999")
-def art_candidates(title,artist):
-    wanted_artist, wanted_title = match_artist(artist),match_title(title)
-    matches = {}
-    original_albums = {
-        (match_artist("Bruce Hornsby And The Range"),match_title("The Way It Is")): ("The Way It Is","Bruce Hornsby"),
-        (match_artist("Stevie Nicks, Tom Petty and the Heartbreakers"),match_title("Stop Draggin' My Heart Around")): ("Bella Donna","Stevie Nicks"),
-    }
-    original = original_albums.get((wanted_artist,wanted_title))
-    for country in ("SG","US"):
-        try:
-            results = search_art(artist+" "+title,country)
-            if original:
-                results += search_art(original[1]+" "+original[0]+" "+title,country)
-        except Exception:
-            continue
-        for item in results:
-            track_name = item.get("trackName","")
-            if match_title(track_name)!=wanted_title:
-                continue
-            credited = item.get("artistName","")
-            featured = re.search(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^)\]]+)",track_name,re.I)
-            known_original = bool(original and art_norm(item.get("collectionName","")) == art_norm(original[0]) and match_artist(credited).startswith(match_artist(original[1])))
-            if not known_original and match_artist(credited)!=wanted_artist and (not featured or match_artist(credited+" "+featured.group(1))!=wanted_artist):
-                continue
-            url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
-            parsed = urlparse(url)
-            if parsed.scheme!="https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
-                continue
-            matches[url] = item
-    return sorted(matches.values(),key=lambda item: (not bool(original and art_norm(item.get("collectionName",""))==art_norm(original[0])),art_rank(item)))
-def save_art_candidate(key,item):
-    url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
-    with urlopen(url,timeout=8) as response:
-        data = response.read(2000001)
-    if len(data)>2000000 or not data.startswith(b"\xff\xd8\xff"):
-        return False
-    art_dir.mkdir(parents=True,exist_ok=True)
-    tmp = art_dir/(key+".tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp,art_dir/(key+".jpg"))
-    meta = art_dir/(key+".json")
-    tmp = art_dir/(key+".json.tmp")
-    tmp.write_text(json.dumps({"album":item.get("collectionName"),"year":(item.get("releaseDate") or "")[:4],"source":"iTunes","compilation":art_rank(item)[0],"url":url}))
-    os.replace(tmp,meta)
-    return True
 def fetch_art(title, artist, key):
     try:
-        for item in art_candidates(title,artist):
+        wanted_artist = match_artist(artist)
+        wanted_title = match_title(title)
+        # Require matching title and full artist credit, including featured credits
+        # carried in the catalogue track name. Never accept title-only matches.
+        for country in ("SG","US"):
             try:
-                if (art_dir/(key+".jpg")).exists() and art_info(key) and not art_info(key).get("compilation") and art_rank(item)[0]:
-                    return
-                if save_art_candidate(key,item):
-                    return
+                results = search_art(artist+" "+title,country)
             except Exception:
                 continue
+            matches = []
+            for item in results:
+                track_name = item.get("trackName","")
+                if match_title(track_name)!=wanted_title:
+                    continue
+                credited = item.get("artistName","")
+                featured = re.search(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^)\]]+)",track_name,re.I)
+                if match_artist(credited)!=wanted_artist and (not featured or match_artist(credited+" "+featured.group(1))!=wanted_artist):
+                    continue
+                collection = item.get("collectionName","").casefold()
+                compilation = bool(re.search(r"greatest hits|best of|collection|anthology|various artists|essential",collection))
+                matches.append((compilation,item.get("releaseDate") or "9999",item))
+            for _,_,item in sorted(matches,key=lambda x:(x[0],x[1])):
+                url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
+                parsed = urlparse(url)
+                if parsed.scheme!="https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
+                    continue
+                try:
+                    with urlopen(url,timeout=8) as response:
+                        data = response.read(2000001)
+                    if len(data)>2000000 or not data.startswith(b"\xff\xd8\xff"):
+                        continue
+                    art_dir.mkdir(parents=True,exist_ok=True)
+                    tmp = art_dir/(key+".tmp")
+                    tmp.write_bytes(data)
+                    os.replace(tmp,art_dir/(key+".jpg"))
+                    return
+                except Exception:
+                    continue
     except Exception:
         pass
     finally:
@@ -310,7 +290,7 @@ def album_art(title, artist):
         return None
     key = art_key(title, artist)
     if (art_dir / (key+".jpg")).is_file():
-        return "/api/artwork/"+key+"?v="+str((art_dir/(key+".jpg")).stat().st_mtime_ns)
+        return "/api/artwork/"+key
     with art_lock:
         if key not in art_pending and art_misses.get(key,0)<time.monotonic() and len(art_pending)<8:
             art_pending.add(key)
@@ -323,7 +303,7 @@ def artwork(key: str):
     path = art_dir / (key+".jpg")
     if not path.is_file():
         raise HTTPException(404)
-    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control":"private, no-cache"})
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control":"private, max-age=86400"})
 
 # Bulk artwork management: single rate-limited worker, persistent results.
 from PIL import Image
@@ -364,13 +344,13 @@ def local_art_admin(request):
         or any(request.headers.get(h) for h in ("x-awc-remote","x-forwarded-for","forwarded"))
         or request.headers.get("origin")!="http://"+LOCAL_HOST):
         raise HTTPException(403,"Artwork management requires local access")
-def bulk_run(items, retry, review=False):
+def bulk_run(items, retry):
     results = bulk_load()
     try:
         for key,item in items:
             if bulk_pause.is_set():
                 break
-            if review or (not (art_dir/(key+".jpg")).is_file() and (retry or key not in results)):
+            if not (art_dir/(key+".jpg")).is_file() and (retry or key not in results):
                 # Share the existing single lookup worker with live playback.
                 with art_lock:
                     pending = key in art_pending
@@ -394,11 +374,6 @@ def bulk_run(items, retry, review=False):
     finally:
         with bulk_lock:
             bulk_state["running"] = False
-def art_info(key):
-    try:
-        return json.loads((art_dir/(key+".json")).read_text())
-    except (OSError,ValueError):
-        return {}
 @app.get("/api/artwork-manager/status")
 def bulk_status():
     library = artwork_library()
@@ -412,7 +387,7 @@ def bulk_status():
                 stations=[{"name":n,"total":sum(n in v["stations"] for v in library.values()),
                            "cached":sum(n in library[k]["stations"] for k in cached)} for n in names],
                 missing=[library[k] for k in sorted(missing)],
-                covers=[dict(library[k],key=k,**art_info(k)) for k in sorted(cached)[:100]],
+                covers=[dict(library[k],key=k) for k in sorted(cached)[:100]],
                 bytes=sum(p.stat().st_size for p in art_dir.glob("*.jpg")))
 @app.post("/api/artwork-manager/{action}")
 def bulk_control(action: str, request: Request, station: str="all"):
@@ -420,7 +395,7 @@ def bulk_control(action: str, request: Request, station: str="all"):
     if action=="pause":
         bulk_pause.set()
         return {"ok":True}
-    if action not in ("start","retry","review"):
+    if action not in ("start","retry"):
         raise HTTPException(404)
     library = artwork_library()
     if station!="all" and station not in state["index"]["stations"]:
@@ -431,7 +406,7 @@ def bulk_control(action: str, request: Request, station: str="all"):
             raise HTTPException(409,"Already running")
         bulk_pause.clear()
         bulk_state.update(running=True,station=station,processed=0,total=len(items))
-        threading.Thread(target=bulk_run,args=(items,action=="retry",action=="review"),daemon=True).start()
+        threading.Thread(target=bulk_run,args=(items,action=="retry"),daemon=True).start()
     return {"ok":True}
 @app.get("/api/artwork-manager/export")
 def bulk_export(request: Request):
