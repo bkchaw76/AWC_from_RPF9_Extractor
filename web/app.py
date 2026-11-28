@@ -207,6 +207,68 @@ def logo(name: str):
         raise HTTPException(404, "Logo not found")
     return FileResponse(path, media_type="image/png")
 
+# Artwork lookups are independent of the streaming pipeline.
+from urllib.parse import urlencode, urlparse
+from urllib.request import urlopen, Request as URLRequest
+from concurrent.futures import ThreadPoolExecutor
+import unicodedata
+art_pool = ThreadPoolExecutor(max_workers=1)
+art_lock = threading.Lock()
+art_pending = set()
+art_misses = {}
+art_dir = Path(os.environ["APPDATA"]) / "album-art"
+def art_norm(value):
+    return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
+def art_key(title, artist):
+    return hashlib.sha256((art_norm(title)+"|"+art_norm(artist)).encode()).hexdigest()
+def fetch_art(title, artist, key):
+    try:
+        query = urlencode({"term": artist+" "+title, "entity":"song", "limit":15, "country":"SG"})
+        with urlopen("https://itunes.apple.com/search?"+query, timeout=8) as response:
+            results = json.loads(response.read(1000000)).get("results", [])
+        for item in results:
+            if art_norm(item.get("trackName","")) != art_norm(title) or art_norm(item.get("artistName","")) != art_norm(artist):
+                continue
+            url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
+                continue
+            with urlopen(url, timeout=8) as response:
+                data = response.read(2000001)
+            if len(data)>2000000 or not data.startswith(b"\xff\xd8\xff"):
+                continue
+            art_dir.mkdir(parents=True, exist_ok=True)
+            tmp = art_dir / (key+".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, art_dir / (key+".jpg"))
+            return
+    except Exception:
+        pass
+    finally:
+        with art_lock:
+            art_pending.discard(key)
+            if not (art_dir / (key+".jpg")).exists():
+                art_misses[key] = time.monotonic()+3600
+def album_art(title, artist):
+    if not title or not artist:
+        return None
+    key = art_key(title, artist)
+    if (art_dir / (key+".jpg")).is_file():
+        return "/api/artwork/"+key
+    with art_lock:
+        if key not in art_pending and art_misses.get(key,0)<time.monotonic() and len(art_pending)<8:
+            art_pending.add(key)
+            art_pool.submit(fetch_art,title,artist,key)
+    return None
+@app.get("/api/artwork/{key}")
+def artwork(key: str):
+    if len(key)!=64 or any(c not in "0123456789abcdef" for c in key):
+        raise HTTPException(404)
+    path = art_dir / (key+".jpg")
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control":"private, max-age=86400"})
+
 @app.get("/api/stations/{name}/now")
 def now_playing(name: str):
     idx, sched = station(name)
@@ -230,8 +292,13 @@ def now_playing(name: str):
             if title:
                 next_song = {"title": title, "artist": artist}
                 break
-    return {"station": name, "kind": kind, "title": (seg[1] if seg and seg[1] else track.get("title", "")),
-            "artist": (seg[2] if seg and seg[1] else track.get("artist", "")), "start": start, "end": end, "next_song": next_song}
+    title = seg[1] if seg and seg[1] else track.get("title", "")
+    artist = seg[2] if seg and seg[1] else track.get("artist", "")
+    art = album_art(title, artist) if kind == "song" else None
+    if next_song:
+        album_art(next_song["title"], next_song["artist"])
+    return {"station": name, "kind": kind, "title": title, "artist": artist,
+            "start": start, "end": end, "next_song": next_song, "artwork": art}
 
 def track_file(idx, tr):
     dest = Path(cache_dir()) / ("r_" + _tkey(tr) + ".opus")
