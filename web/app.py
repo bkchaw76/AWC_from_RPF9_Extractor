@@ -221,27 +221,63 @@ def art_norm(value):
     return "".join(c for c in unicodedata.normalize("NFKC", value).casefold() if c.isalnum())
 def art_key(title, artist):
     return hashlib.sha256((art_norm(title)+"|"+art_norm(artist)).encode()).hexdigest()
+import re
+def match_artist(value):
+    value = unicodedata.normalize("NFKC", value).casefold()
+    value = re.sub(r"\b(?:and|with|featuring|feat|ft)\b\.?|&|,", " ", value)
+    return art_norm(value)
+def match_title(value):
+    value = re.sub(r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]", "", value, flags=re.I)
+    value = re.sub(r"\s*(?:[-–—]\s*|[\(\[]\s*)(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?\s*[)\]]?\s*$", "", value, flags=re.I)
+    return art_norm(value)
+art_last_query = 0.0
+def search_art(term, country):
+    global art_last_query
+    time.sleep(max(0, 3.2-(time.monotonic()-art_last_query)))
+    art_last_query = time.monotonic()
+    query = urlencode({"term":term,"entity":"song","limit":25,"country":country})
+    with urlopen("https://itunes.apple.com/search?"+query,timeout=8) as response:
+        return json.loads(response.read(2000000)).get("results",[])
 def fetch_art(title, artist, key):
     try:
-        query = urlencode({"term": artist+" "+title, "entity":"song", "limit":15, "country":"SG"})
-        with urlopen("https://itunes.apple.com/search?"+query, timeout=8) as response:
-            results = json.loads(response.read(1000000)).get("results", [])
-        for item in results:
-            if art_norm(item.get("trackName","")) != art_norm(title) or art_norm(item.get("artistName","")) != art_norm(artist):
+        wanted_artist = match_artist(artist)
+        wanted_title = match_title(title)
+        # Require matching title and full artist credit, including featured credits
+        # carried in the catalogue track name. Never accept title-only matches.
+        for country in ("SG","US"):
+            try:
+                results = search_art(artist+" "+title,country)
+            except Exception:
                 continue
-            url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
-            parsed = urlparse(url)
-            if parsed.scheme != "https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
-                continue
-            with urlopen(url, timeout=8) as response:
-                data = response.read(2000001)
-            if len(data)>2000000 or not data.startswith(b"\xff\xd8\xff"):
-                continue
-            art_dir.mkdir(parents=True, exist_ok=True)
-            tmp = art_dir / (key+".tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, art_dir / (key+".jpg"))
-            return
+            matches = []
+            for item in results:
+                track_name = item.get("trackName","")
+                if match_title(track_name)!=wanted_title:
+                    continue
+                credited = item.get("artistName","")
+                featured = re.search(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^)\]]+)",track_name,re.I)
+                if match_artist(credited)!=wanted_artist and (not featured or match_artist(credited+" "+featured.group(1))!=wanted_artist):
+                    continue
+                collection = item.get("collectionName","").casefold()
+                compilation = bool(re.search(r"greatest hits|best of|collection|anthology|various artists|essential",collection))
+                matches.append((compilation,item.get("releaseDate") or "9999",item))
+            for _,_,item in sorted(matches,key=lambda x:(x[0],x[1])):
+                url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
+                parsed = urlparse(url)
+                if parsed.scheme!="https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
+                    continue
+                try:
+                    with urlopen(url,timeout=8) as response:
+                        data = response.read(2000001)
+                    if len(data)>2000000 or not data.startswith(b"\xff\xd8\xff"):
+                        continue
+                    art_dir.mkdir(parents=True,exist_ok=True)
+                    tmp = art_dir/(key+".tmp")
+                    tmp.write_bytes(data)
+                    os.replace(tmp,art_dir/(key+".jpg"))
+                    return
+                except Exception:
+                    continue
     except Exception:
         pass
     finally:
