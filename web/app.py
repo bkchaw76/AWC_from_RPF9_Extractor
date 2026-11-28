@@ -269,6 +269,143 @@ def artwork(key: str):
         raise HTTPException(404)
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control":"private, max-age=86400"})
 
+# Bulk artwork management: single rate-limited worker, persistent results.
+from PIL import Image
+import zipfile, tempfile
+bulk_lock = threading.Lock()
+bulk_state = {"running": False, "station": "all", "processed": 0, "total": 0}
+bulk_pause = threading.Event()
+bulk_results = art_dir / "bulk-results.json"
+def artwork_library():
+    idx = state.get("index")
+    if not idx:
+        raise HTTPException(503, "Index not ready")
+    library = {}
+    for name, station_data in idx["stations"].items():
+        for track in station_data.get("songs", []):
+            pairs = [(track.get("title"), track.get("artist"))]
+            pairs += [(part[1],part[2]) for part in track.get("m",[]) if len(part)>=3]
+            for title, artist in pairs:
+                if not title or not artist:
+                    continue
+                key = art_key(title,artist)
+                item = library.setdefault(key, {"title":title,"artist":artist,"stations":[]})
+                if name not in item["stations"]:
+                    item["stations"].append(name)
+    return library
+def bulk_load():
+    try:
+        return json.loads(bulk_results.read_text())
+    except (OSError, ValueError):
+        return {}
+def bulk_save(results):
+    art_dir.mkdir(parents=True,exist_ok=True)
+    tmp = bulk_results.with_suffix(".tmp")
+    tmp.write_text(json.dumps(results,ensure_ascii=False))
+    os.replace(tmp,bulk_results)
+def local_art_admin(request):
+    if (request.headers.get("host","").lower()!=LOCAL_HOST.lower()
+        or any(request.headers.get(h) for h in ("x-awc-remote","x-forwarded-for","forwarded"))
+        or request.headers.get("origin")!="http://"+LOCAL_HOST):
+        raise HTTPException(403,"Artwork management requires local access")
+def bulk_run(items, retry):
+    results = bulk_load()
+    try:
+        for key,item in items:
+            if bulk_pause.is_set():
+                break
+            if not (art_dir/(key+".jpg")).is_file() and (retry or key not in results):
+                # Share the existing single lookup worker with live playback.
+                with art_lock:
+                    pending = key in art_pending
+                    if not pending:
+                        art_pending.add(key)
+                        future = art_pool.submit(fetch_art,item["title"],item["artist"],key)
+                if pending:
+                    while True:
+                        with art_lock:
+                            if key not in art_pending:
+                                break
+                        time.sleep(.2)
+                else:
+                    future.result()
+                results[key] = "cached" if (art_dir/(key+".jpg")).is_file() else "unmatched"
+                bulk_save(results)
+                if bulk_pause.wait(3.2):
+                    break
+            with bulk_lock:
+                bulk_state["processed"] += 1
+    finally:
+        with bulk_lock:
+            bulk_state["running"] = False
+@app.get("/api/artwork-manager/status")
+def bulk_status():
+    library = artwork_library()
+    results = bulk_load()
+    cached = {k for k in library if (art_dir/(k+".jpg")).is_file()}
+    missing = {k for k in library if k not in cached and results.get(k)=="unmatched"}
+    names = list(state["index"]["stations"])
+    with bulk_lock:
+        progress = dict(bulk_state)
+    return dict(progress, unique=len(library), downloaded=len(cached), unmatched=len(missing),
+                stations=[{"name":n,"total":sum(n in v["stations"] for v in library.values()),
+                           "cached":sum(n in library[k]["stations"] for k in cached)} for n in names],
+                missing=[library[k] for k in sorted(missing)],
+                covers=[dict(library[k],key=k) for k in sorted(cached)[:100]],
+                bytes=sum(p.stat().st_size for p in art_dir.glob("*.jpg")))
+@app.post("/api/artwork-manager/{action}")
+def bulk_control(action: str, request: Request, station: str="all"):
+    local_art_admin(request)
+    if action=="pause":
+        bulk_pause.set()
+        return {"ok":True}
+    if action not in ("start","retry"):
+        raise HTTPException(404)
+    library = artwork_library()
+    if station!="all" and station not in state["index"]["stations"]:
+        raise HTTPException(400,"Unknown station")
+    items = [(k,v) for k,v in library.items() if station=="all" or station in v["stations"]]
+    with bulk_lock:
+        if bulk_state["running"]:
+            raise HTTPException(409,"Already running")
+        bulk_pause.clear()
+        bulk_state.update(running=True,station=station,processed=0,total=len(items))
+        threading.Thread(target=bulk_run,args=(items,action=="retry"),daemon=True).start()
+    return {"ok":True}
+@app.get("/api/artwork-manager/export")
+def bulk_export(request: Request):
+    if request.headers.get("host","").lower()!=LOCAL_HOST.lower() or any(request.headers.get(h) for h in ("x-awc-remote","x-forwarded-for","forwarded")):
+        raise HTTPException(403,"Local access required")
+    from io import BytesIO
+    from starlette.background import BackgroundTask
+    library = artwork_library()
+    fd, filename = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    manifest = {}
+    try:
+        with zipfile.ZipFile(filename,"w",zipfile.ZIP_STORED) as archive:
+            for key,item in library.items():
+                path = art_dir/(key+".jpg")
+                if not path.is_file():
+                    continue
+                try:
+                    with Image.open(path) as img:
+                        img.thumbnail((160,160))
+                        buf = BytesIO()
+                        img.convert("RGB").save(buf,format="JPEG",quality=85)
+                    archive.writestr("artwork/"+key+".jpg",buf.getvalue())
+                    manifest[key] = dict(item,file="artwork/"+key+".jpg")
+                except (OSError,ValueError):
+                    continue
+            archive.writestr("artwork.json",json.dumps(manifest,ensure_ascii=False))
+        return FileResponse(filename,filename="AWC-Core2-Artwork.zip",media_type="application/zip",background=BackgroundTask(os.unlink,filename))
+    except Exception:
+        os.unlink(filename)
+        raise
+@app.get("/artwork")
+def artwork_manager():
+    return FileResponse(ROOT / "web/static/artwork.html")
+
 @app.get("/api/stations/{name}/now")
 def now_playing(name: str):
     idx, sched = station(name)
