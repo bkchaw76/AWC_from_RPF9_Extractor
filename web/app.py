@@ -246,9 +246,16 @@ def art_rank(item):
 def art_candidates(title,artist):
     wanted_artist, wanted_title = match_artist(artist),match_title(title)
     matches = {}
+    original_albums = {
+        (match_artist("Bruce Hornsby And The Range"),match_title("The Way It Is")): ("The Way It Is","Bruce Hornsby"),
+        (match_artist("Stevie Nicks, Tom Petty and the Heartbreakers"),match_title("Stop Draggin' My Heart Around")): ("Bella Donna","Stevie Nicks"),
+    }
+    original = original_albums.get((wanted_artist,wanted_title))
     for country in ("SG","US"):
         try:
             results = search_art(artist+" "+title,country)
+            if original:
+                results += search_art(original[1]+" "+original[0]+" "+title,country)
         except Exception:
             continue
         for item in results:
@@ -257,14 +264,15 @@ def art_candidates(title,artist):
                 continue
             credited = item.get("artistName","")
             featured = re.search(r"[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+([^)\]]+)",track_name,re.I)
-            if match_artist(credited)!=wanted_artist and (not featured or match_artist(credited+" "+featured.group(1))!=wanted_artist):
+            known_original = bool(original and art_norm(item.get("collectionName","")) == art_norm(original[0]) and match_artist(credited).startswith(match_artist(original[1])))
+            if not known_original and match_artist(credited)!=wanted_artist and (not featured or match_artist(credited+" "+featured.group(1))!=wanted_artist):
                 continue
             url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
             parsed = urlparse(url)
             if parsed.scheme!="https" or not (parsed.hostname or "").endswith(".mzstatic.com"):
                 continue
             matches[url] = item
-    return sorted(matches.values(),key=art_rank)
+    return sorted(matches.values(),key=lambda item: (not bool(original and art_norm(item.get("collectionName",""))==art_norm(original[0])),art_rank(item)))
 def save_art_candidate(key,item):
     url = item.get("artworkUrl100","").replace("100x100bb","600x600bb")
     with urlopen(url,timeout=8) as response:
@@ -302,7 +310,7 @@ def album_art(title, artist):
         return None
     key = art_key(title, artist)
     if (art_dir / (key+".jpg")).is_file():
-        return "/api/artwork/"+key
+        return "/api/artwork/"+key+"?v="+str((art_dir/(key+".jpg")).stat().st_mtime_ns)
     with art_lock:
         if key not in art_pending and art_misses.get(key,0)<time.monotonic() and len(art_pending)<8:
             art_pending.add(key)
@@ -315,7 +323,7 @@ def artwork(key: str):
     path = art_dir / (key+".jpg")
     if not path.is_file():
         raise HTTPException(404)
-    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control":"private, max-age=86400"})
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control":"private, no-cache"})
 
 # Bulk artwork management: single rate-limited worker, persistent results.
 from PIL import Image
